@@ -50,18 +50,23 @@ pub trait NativeDisplay: std::any::Any {
     }
     fn show_keyboard(&mut self, _show: bool) {}
 
-    fn set_pause_resume_listener(&mut self, _listener: fn(bool)) {
-    }
+    fn set_pause_resume_listener(&mut self, _listener: fn(bool)) {}
 
     fn as_any(&mut self) -> &mut dyn std::any::Any;
 }
 
 pub mod module;
 
-#[cfg(target_os = "linux")]
+#[cfg(target_env = "ohos")]
+pub mod ohos;
+
+#[cfg(target_env = "ohos")]
+pub use ohos::*;
+
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod linux_x11;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod linux_wayland;
 
 #[cfg(target_os = "android")]
