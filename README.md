@@ -12,12 +12,19 @@ Miniquad aims to provide a graphics abstraction that works the same way on any p
 
 ## Supported Platforms
 
-* Windows, OpenGL 3;
-* Linux, OpenGL 3, GLES 2, GLES 3;
-* macOS, OpenGL 3;
+* Windows, OpenGL 3, Vulkan;
+* Linux, OpenGL 3, GLES 2, GLES 3, Vulkan;
+* macOS, OpenGL 3, Vulkan (via MoltenVK);
 * iOS, GLES 2, GLES 3;
 * WASM, WebGL 1 - tested on iOS Safari, Firefox, Chrome;
-* Android, GLES 2, GLES 3.
+* Android, GLES 2, GLES 3, Vulkan.
+
+## Rendering Backends
+
+Miniquad supports multiple rendering backends:
+
+* **OpenGL** - Default backend, works on all platforms
+* **Vulkan** - Modern graphics API (optional, enable with `vulkan` feature)
 
 ## Not Supported, but Desirable Platforms
 

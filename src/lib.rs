@@ -24,6 +24,9 @@ pub use native::{gl, NativeDisplay};
 
 pub use graphics::GraphicsContext as Context;
 
+#[cfg(feature = "vulkan")]
+pub use graphics::backend::{GraphicsContextWrapper, RenderingBackendContext};
+
 pub mod date {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn now() -> f64 {
@@ -180,6 +183,23 @@ pub enum CursorIcon {
     NSResize,
     NESWResize,
     NWSEResize,
+}
+
+/// Start miniquad with specified rendering backend.
+pub fn start_with_backend<F>(conf: conf::Conf, f: F)
+where
+    F: 'static + FnOnce(&mut Context) -> Box<dyn EventHandler>,
+{
+    // Check if the requested backend is available
+    #[cfg(feature = "vulkan")]
+    if conf.platform.rendering_backend == conf::RenderingBackend::Vulkan 
+        && !graphics::backend::RenderingBackendContext::is_available(conf::RenderingBackend::Vulkan) {
+        panic!("Vulkan backend requested but not available");
+    }
+    
+    // For now, delegate to the original start function
+    // TODO: Implement backend-specific initialization
+    start(conf, f);
 }
 
 /// Start miniquad.

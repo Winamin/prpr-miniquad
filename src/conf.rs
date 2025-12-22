@@ -62,6 +62,21 @@ pub enum LinuxBackend {
     WaylandWithX11Fallback,
 }
 
+/// Rendering backend selection
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RenderingBackend {
+    /// OpenGL backend (default)
+    OpenGL,
+    /// Vulkan backend (if available)
+    Vulkan,
+}
+
+impl Default for RenderingBackend {
+    fn default() -> Self {
+        RenderingBackend::OpenGL
+    }
+}
+
 /// Platform specific settings.
 #[derive(Debug)]
 pub struct Platform {
@@ -90,6 +105,9 @@ pub struct Platform {
     /// TODO: Make it works on web, on web it should make a transparent HTML5 canvas
     /// TODO: Document(and check) what does it actually mean on android. Transparent window?
     pub framebuffer_alpha: bool,
+
+    /// Rendering backend selection
+    pub rendering_backend: RenderingBackend,
 }
 
 impl Default for Platform {
@@ -99,6 +117,7 @@ impl Default for Platform {
             swap_interval: None,
             linux_backend: LinuxBackend::X11Only,
             framebuffer_alpha: false,
+            rendering_backend: RenderingBackend::OpenGL,
         }
     }
 }

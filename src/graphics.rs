@@ -2,6 +2,11 @@ use std::{ffi::CString, mem};
 
 mod texture;
 
+#[cfg(feature = "vulkan")]
+mod vulkan;
+
+pub mod backend;
+
 use crate::{native::gl::*, Context};
 
 use std::{error::Error, fmt::Display};
