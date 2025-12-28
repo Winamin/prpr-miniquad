@@ -106,8 +106,27 @@ pub struct Platform {
     /// TODO: Document(and check) what does it actually mean on android. Transparent window?
     pub framebuffer_alpha: bool,
 
+    /// Multisample anti-aliasing configuration
+    pub multisample_antialiasing: MultisampleConfig,
+
     /// Rendering backend selection
     pub rendering_backend: RenderingBackend,
+}
+
+/// Multisample anti-aliasing configuration
+#[derive(Debug, Copy, Clone)]
+pub struct MultisampleConfig {
+    pub sample_count: i32,
+    pub enabled: bool,
+}
+
+impl Default for MultisampleConfig {
+    fn default() -> MultisampleConfig {
+        MultisampleConfig {
+            sample_count: 1,
+            enabled: false,
+        }
+    }
 }
 
 impl Default for Platform {
@@ -118,6 +137,7 @@ impl Default for Platform {
             linux_backend: LinuxBackend::X11Only,
             framebuffer_alpha: false,
             rendering_backend: RenderingBackend::OpenGL,
+            multisample_antialiasing: MultisampleConfig::default(),
         }
     }
 }
@@ -203,7 +223,7 @@ impl Default for Conf {
             window_height: 600,
             high_dpi: false,
             fullscreen: false,
-            sample_count: 1,
+            sample_count: 4, // Default to 4x MSAA
             window_resizable: true,
             icon: Some(Icon::miniquad_logo()),
             platform: Default::default(),
