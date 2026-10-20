@@ -1,8 +1,8 @@
 use crate::{
-    conf::{Conf, Icon},
+    conf::{Conf, Icon, RenderingBackend},
     event::{KeyMods, MouseButton, TouchPhase},
     native::NativeDisplayData,
-    Context, CursorIcon, EventHandler, GraphicsContext,
+    Context, CursorIcon, EventHandler,
 };
 
 use std::{
@@ -182,7 +182,7 @@ impl crate::native::NativeDisplay for Display {
 
 struct WindowPayload {
     event_handler: Box<dyn EventHandler>,
-    context: GraphicsContext,
+    context: crate::graphics::Context,
     display: Display,
 }
 
@@ -911,17 +911,54 @@ where
         display.update_dimensions(wnd);
         display.init_dpi(conf.high_dpi);
 
-        let mut wgl = wgl::Wgl::new(&mut display);
-        let gl_ctx = wgl.create_context(
-            &mut display,
-            conf.sample_count,
-            conf.platform.swap_interval.unwrap_or(1),
-            conf.platform.opengl_version,
-        );
+        let vulkan = conf.platform.rendering_backend == RenderingBackend::Vulkan;
 
-        super::gl::load_gl_funcs(|proc| display.get_proc_address(proc));
+        // The OpenGL backend needs a WGL context and the GL entry points loaded
+        // before the graphics context is created. Vulkan presents through the
+        // swap chain instead and needs neither.
+        let gl_ctx = if vulkan {
+            std::ptr::null_mut()
+        } else {
+            let mut wgl = wgl::Wgl::new(&mut display);
+            let gl_ctx = wgl.create_context(
+                &mut display,
+                conf.sample_count,
+                conf.platform.swap_interval.unwrap_or(1),
+                conf.platform.opengl_version,
+            );
+            super::gl::load_gl_funcs(|proc| display.get_proc_address(proc));
+            gl_ctx
+        };
 
-        let mut context = GraphicsContext::new(crate::gl::is_gl2());
+        let mut context = if vulkan {
+            // Win32 Vulkan surfaces are created from the window handle alone;
+            // the display handle carries no information there.
+            let hinstance = winapi::um::libloaderapi::GetModuleHandleW(std::ptr::null());
+            let display_handle = raw_window_handle::WindowsDisplayHandle::empty();
+            let mut window_handle = raw_window_handle::Win32WindowHandle::empty();
+            window_handle.hwnd = wnd as *mut _;
+            window_handle.hinstance = hinstance as *mut _;
+
+            let raw_display = raw_window_handle::RawDisplayHandle::Windows(display_handle);
+            let raw_window = raw_window_handle::RawWindowHandle::Win32(window_handle);
+            let size = (
+                display.display_data.screen_width.max(0) as u32,
+                display.display_data.screen_height.max(0) as u32,
+            );
+            crate::graphics::Context::new(
+                conf.platform.rendering_backend,
+                false,
+                Some((raw_display, raw_window)),
+                size,
+            )
+        } else {
+            crate::graphics::Context::new(
+                conf.platform.rendering_backend,
+                crate::gl::is_gl2(),
+                None,
+                (0, 0),
+            )
+        };
 
         let event_handler = f(context.with_display(&mut display));
 
@@ -949,7 +986,12 @@ where
             p.event_handler
                 .update(p.context.with_display(&mut p.display));
             p.event_handler.draw(p.context.with_display(&mut p.display));
-            SwapBuffers(p.display.dc);
+
+            if vulkan {
+                p.context.swap_buffers();
+            } else {
+                SwapBuffers(p.display.dc);
+            }
 
             if p.display.update_dimensions(wnd) {
                 let width = p.display.display_data.screen_width as _;
@@ -961,7 +1003,12 @@ where
                 PostMessageW(p.display.wnd, WM_CLOSE, 0, 0);
             }
         }
-        (p.display.libopengl32.wglDeleteContext)(gl_ctx);
+        if !vulkan {
+            (p.display.libopengl32.wglDeleteContext)(gl_ctx);
+        }
+        if vulkan {
+            p.context.cleanup_backend();
+        }
         DestroyWindow(wnd);
     }
 }

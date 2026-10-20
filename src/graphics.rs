@@ -5,13 +5,13 @@ mod texture;
 #[cfg(feature = "vulkan")]
 mod vulkan;
 
-pub mod backend;
-
-use crate::{native::gl::*, Context};
+use crate::native::gl::*;
 
 use std::{error::Error, fmt::Display};
 
-pub use texture::{FilterMode, Texture, TextureAccess, TextureFormat, TextureParams, TextureWrap};
+pub use texture::{
+    FilterMode, MipmapFilter, Texture, TextureAccess, TextureFormat, TextureParams, TextureWrap,
+};
 
 fn get_uniform_location(program: GLuint, name: &str) -> Option<i32> {
     let cname = CString::new(name).unwrap_or_else(|e| panic!("{}", e));
@@ -309,9 +309,17 @@ impl Shader {
         fragment_shader: &str,
         meta: ShaderMeta,
     ) -> Result<Shader, ShaderError> {
-        let shader = load_shader_internal(vertex_shader, fragment_shader, meta)?;
-        ctx.shaders.push(shader);
-        Ok(Shader(ctx.shaders.len() - 1))
+        match ctx.backend() {
+            GraphicsBackend::OpenGL(_) => {
+                let shader = load_shader_internal(vertex_shader, fragment_shader, meta)?;
+                ctx.opengl().shaders.push(shader);
+                Ok(Shader(ctx.opengl().shaders.len() - 1))
+            }
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(_) => ctx
+                .vulkan()
+                .new_shader(vertex_shader, fragment_shader, meta),
+        }
     }
 }
 
@@ -536,6 +544,7 @@ impl GlCache {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PassAction {
     Nothing,
     Clear {
@@ -572,6 +581,21 @@ struct RenderPassInternal {
     gl_fb: GLuint,
     texture: Texture,
     depth_texture: Option<Texture>,
+    /// Framebuffer the multisampled colour is blitted to when the pass ends.
+    resolve_gl_fb: GLuint,
+    samples: u32,
+}
+
+impl Default for RenderPassInternal {
+    fn default() -> Self {
+        RenderPassInternal {
+            gl_fb: 0,
+            texture: Texture::empty(),
+            depth_texture: None,
+            resolve_gl_fb: 0,
+            samples: 1,
+        }
+    }
 }
 
 impl RenderPass {
@@ -580,9 +604,11 @@ impl RenderPass {
             gl_fb,
             texture: dummy_texture,
             depth_texture: None,
+            resolve_gl_fb: 0,
+            samples: 1,
         };
-        ctx.passes.push(pass);
-        Self(ctx.passes.len() - 1)
+        ctx.opengl().passes.push(pass);
+        RenderPass(ctx.opengl().passes.len() - 1)
     }
 
     pub fn new(
@@ -590,9 +616,160 @@ impl RenderPass {
         color_img: Texture,
         depth_img: impl Into<Option<Texture>>,
     ) -> RenderPass {
-        let mut gl_fb = 0;
-
         let depth_img = depth_img.into();
+
+        match ctx.backend() {
+            GraphicsBackend::OpenGL(_) => RenderPass::new_opengl(ctx, color_img, depth_img),
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(_) => {
+                RenderPass(ctx.vulkan().new_render_pass(color_img, depth_img))
+            }
+        }
+    }
+
+    /// Render pass that draws with `samples` samples per pixel and resolves
+    /// the result into `resolve_img` when the pass ends.
+    ///
+    /// [`RenderPass::samples`] reports the count that was actually used, which
+    /// is 1 when the backend cannot multisample at all.
+    pub fn new_multisampled(
+        ctx: &mut Context,
+        resolve_img: Texture,
+        samples: u32,
+    ) -> RenderPass {
+        match ctx.backend() {
+            GraphicsBackend::OpenGL(_) => {
+                RenderPass::new_multisampled_opengl(ctx, resolve_img, samples)
+            }
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(_) => {
+                let samples = vulkan::vk_sample_count_flags(samples, ctx.vulkan().color_sample_counts)
+                    .as_raw();
+                if samples == 1 {
+                    return RenderPass::new(ctx, resolve_img, None);
+                }
+                let vk_ctx = ctx.vulkan();
+                let color = vk_ctx.new_multisample_texture(
+                    TextureParams {
+                        format: resolve_img.format,
+                        wrap: resolve_img.wrap,
+                        filter: resolve_img.filter,
+                        mipmap_filter: MipmapFilter::None,
+                        width: resolve_img.width,
+                        height: resolve_img.height,
+                    },
+                    samples,
+                );
+                let color = Texture {
+                    texture: color as GLuint,
+                    width: resolve_img.width,
+                    height: resolve_img.height,
+                    format: resolve_img.format,
+                    wrap: resolve_img.wrap,
+                    filter: resolve_img.filter,
+                    mipmap_filter: MipmapFilter::None,
+                };
+                // The multisampled colour is attachment 0 and the texture it
+                // resolves into attachment 1.
+                let pass = vk_ctx.new_multisampled_render_pass(color, resolve_img, samples);
+                RenderPass(pass)
+            }
+        }
+    }
+
+    /// Sample count this pass was created with.
+    pub fn samples(&self, ctx: &mut Context) -> u32 {
+        match ctx.backend() {
+            GraphicsBackend::OpenGL(_) => ctx.opengl().passes[self.0].samples,
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(_) => ctx.vulkan().passes[self.0]
+                .as_ref()
+                .expect("the render pass has been deleted")
+                .samples,
+        }
+    }
+
+    fn new_multisampled_opengl(
+        ctx: &mut Context,
+        resolve_img: Texture,
+        mut samples: u32,
+    ) -> RenderPass {
+        let mut resolve_gl_fb = 0;
+        unsafe {
+            glGenFramebuffers(1, &mut resolve_gl_fb as *mut _);
+            glBindFramebuffer(GL_FRAMEBUFFER, resolve_gl_fb);
+            glFramebufferTexture2D(
+                GL_FRAMEBUFFER,
+                GL_COLOR_ATTACHMENT0,
+                GL_TEXTURE_2D,
+                resolve_img.texture,
+                0,
+            );
+        }
+
+        // Halve the request until the driver reports a complete framebuffer,
+        // which is how the GL multisample path has always picked its count.
+        let mut gl_fb = 0;
+        while samples > 1 {
+            unsafe {
+                while glGetError() != GL_NO_ERROR {}
+
+                let mut color_rbo = 0;
+                glGenRenderbuffers(1, &mut color_rbo as *mut _);
+                glBindRenderbuffer(GL_RENDERBUFFER, color_rbo);
+                glRenderbufferStorageMultisample(
+                    GL_RENDERBUFFER,
+                    samples as i32,
+                    GL_RGBA8,
+                    resolve_img.width as i32,
+                    resolve_img.height as i32,
+                );
+
+                glGenFramebuffers(1, &mut gl_fb as *mut _);
+                glBindFramebuffer(GL_FRAMEBUFFER, gl_fb);
+                glFramebufferRenderbuffer(
+                    GL_FRAMEBUFFER,
+                    GL_COLOR_ATTACHMENT0,
+                    GL_RENDERBUFFER,
+                    color_rbo,
+                );
+                let status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                glBindRenderbuffer(GL_RENDERBUFFER, 0);
+
+                if status == GL_FRAMEBUFFER_COMPLETE {
+                    break;
+                }
+                glDeleteFramebuffers(1, &gl_fb);
+                glDeleteRenderbuffers(1, &color_rbo);
+                gl_fb = 0;
+                samples = samples.div_ceil(2);
+            }
+        }
+
+        if gl_fb == 0 {
+            samples = 1;
+            gl_fb = resolve_gl_fb;
+        }
+
+        let pass = RenderPassInternal {
+            gl_fb,
+            texture: resolve_img,
+            depth_texture: None,
+            resolve_gl_fb,
+            samples,
+        };
+        let ctx = ctx.opengl();
+        ctx.passes.push(pass);
+        RenderPass(ctx.passes.len() - 1)
+    }
+
+    fn new_opengl(
+        ctx: &mut Context,
+        color_img: Texture,
+        depth_img: Option<Texture>,
+    ) -> RenderPass {
+        let mut gl_fb = 0;
 
         unsafe {
             glGenFramebuffers(1, &mut gl_fb as *mut _);
@@ -613,39 +790,52 @@ impl RenderPass {
                     0,
                 );
             }
-            glBindFramebuffer(GL_FRAMEBUFFER, ctx.default_framebuffer);
+            glBindFramebuffer(GL_FRAMEBUFFER, ctx.opengl().default_framebuffer);
         }
         let pass = RenderPassInternal {
             gl_fb,
             texture: color_img,
             depth_texture: depth_img,
+            ..Default::default()
         };
 
+        let ctx = ctx.opengl();
         ctx.passes.push(pass);
 
         RenderPass(ctx.passes.len() - 1)
     }
 
     pub fn gl_internal_id(&self, ctx: &mut Context) -> GLuint {
-        let render_pass = &mut ctx.passes[self.0];
-
-        render_pass.gl_fb
+        ctx.opengl().passes[self.0].gl_fb
     }
 
     pub fn texture(&self, ctx: &mut Context) -> Texture {
-        let render_pass = &mut ctx.passes[self.0];
-
-        render_pass.texture
+        match ctx.backend() {
+            GraphicsBackend::OpenGL(_) => ctx.opengl().passes[self.0].texture,
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(_) => ctx.vulkan().passes[self.0]
+                .as_ref()
+                .expect("the render pass has been deleted")
+                .color,
+        }
     }
 
     pub fn delete(&self, ctx: &mut Context) {
-        let render_pass = &mut ctx.passes[self.0];
+        match ctx.backend() {
+            GraphicsBackend::OpenGL(_) => {
+                let render_pass = &mut ctx.opengl().passes[self.0];
 
-        unsafe { glDeleteFramebuffers(1, &mut render_pass.gl_fb as *mut _) }
+                unsafe { glDeleteFramebuffers(1, &mut render_pass.gl_fb as *mut _) }
 
-        render_pass.texture.delete();
-        if let Some(depth_texture) = render_pass.depth_texture {
-            depth_texture.delete();
+                let color = render_pass.texture;
+                let depth = render_pass.depth_texture;
+                color.delete(ctx);
+                if let Some(depth_texture) = depth {
+                    depth_texture.delete(ctx);
+                }
+            }
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(_) => ctx.vulkan().delete_render_pass(self.0),
         }
     }
 }
@@ -671,6 +861,7 @@ pub struct GraphicsContext {
     shaders: Vec<ShaderInternal>,
     pipelines: Vec<PipelineInternal>,
     passes: Vec<RenderPassInternal>,
+    cur_pass: Option<RenderPass>,
     default_framebuffer: GLuint,
     cache: GlCache,
 
@@ -695,6 +886,7 @@ impl GraphicsContext {
                 shaders: vec![],
                 pipelines: vec![],
                 passes: vec![],
+                cur_pass: None,
                 features: Features::from_gles2(is_gles2),
                 cache: GlCache {
                     stored_index_buffer: 0,
@@ -720,6 +912,291 @@ impl GraphicsContext {
 
     pub fn features(&self) -> &Features {
         &self.features
+    }
+}
+/// The rendering backend a [`Context`] is bound to.
+pub enum GraphicsBackend {
+    OpenGL(GraphicsContext),
+    #[cfg(feature = "vulkan")]
+    Vulkan(vulkan::VulkanContext),
+}
+
+/// The graphics context handed to the application. Dispatches every call to the
+/// backend selected by [`conf::RenderingBackend`](crate::conf::RenderingBackend).
+pub struct Context {
+    pub(crate) backend: GraphicsBackend,
+    pub(crate) features: Features,
+    pub(crate) display: Option<*mut dyn crate::NativeDisplay>,
+}
+
+impl Context {
+    /// Create a context for the given backend.
+    ///
+    /// `window`/`display` are the raw handles used to build a Vulkan surface;
+    /// they are ignored by the OpenGL backend, which gets its context from the
+    /// platform window that was created beforehand.
+    pub fn new(
+        backend: crate::conf::RenderingBackend,
+        is_gles2: bool,
+        window: Option<(raw_window_handle::RawDisplayHandle, raw_window_handle::RawWindowHandle)>,
+        window_size: (u32, u32),
+    ) -> Context {
+        match backend {
+            crate::conf::RenderingBackend::OpenGL => Context {
+                backend: GraphicsBackend::OpenGL(GraphicsContext::new(is_gles2)),
+                features: Features::from_gles2(is_gles2),
+                display: None,
+            },
+            #[cfg(feature = "vulkan")]
+            crate::conf::RenderingBackend::Vulkan => {
+                let (display, handle) =
+                    window.expect("The Vulkan backend requires raw window handles");
+                Context {
+                    backend: GraphicsBackend::Vulkan(vulkan::VulkanContext::new(
+                        display,
+                        handle,
+                        window_size,
+                    )),
+                    features: Features {
+                        instancing: true,
+                        alpha_texture: false,
+                    },
+                    display: None,
+                }
+            }
+            #[cfg(not(feature = "vulkan"))]
+            crate::conf::RenderingBackend::Vulkan => {
+                panic!("Vulkan backend requested but the `vulkan` feature is not enabled")
+            }
+        }
+    }
+
+    pub fn backend(&self) -> &GraphicsBackend {
+        &self.backend
+    }
+
+    pub fn rendering_backend(&self) -> crate::conf::RenderingBackend {
+        match self.backend {
+            GraphicsBackend::OpenGL(_) => crate::conf::RenderingBackend::OpenGL,
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(_) => crate::conf::RenderingBackend::Vulkan,
+        }
+    }
+
+    pub fn features(&self) -> &Features {
+        &self.features
+    }
+
+    pub(crate) fn opengl(&mut self) -> &mut GraphicsContext {
+        match &mut self.backend {
+            GraphicsBackend::OpenGL(ctx) => ctx,
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(_) => {
+                panic!("This call requires the OpenGL backend, the context is running Vulkan")
+            }
+        }
+    }
+
+    #[cfg(feature = "vulkan")]
+    pub fn vulkan_context(&mut self) -> Option<&mut vulkan::VulkanContext> {
+        match &mut self.backend {
+            GraphicsBackend::Vulkan(ctx) => Some(ctx),
+            GraphicsBackend::OpenGL(_) => None,
+        }
+    }
+
+    #[cfg(feature = "vulkan")]
+    pub(crate) fn vulkan(&mut self) -> &mut vulkan::VulkanContext {
+        match &mut self.backend {
+            GraphicsBackend::Vulkan(ctx) => ctx,
+            GraphicsBackend::OpenGL(_) => {
+                panic!("This call requires the Vulkan backend, the context is running OpenGL")
+            }
+        }
+    }
+
+    pub fn apply_pipeline(&mut self, pipeline: &Pipeline) {
+        match &mut self.backend {
+            GraphicsBackend::OpenGL(ctx) => ctx.apply_pipeline(pipeline),
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(ctx) => ctx.apply_pipeline(pipeline),
+        }
+    }
+
+    pub fn set_cull_face(&mut self, cull_face: CullFace) {
+        match &mut self.backend {
+            GraphicsBackend::OpenGL(ctx) => ctx.set_cull_face(cull_face),
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(ctx) => ctx.set_cull_face(cull_face),
+        }
+    }
+
+    pub fn set_color_write(&mut self, color_write: ColorMask) {
+        match &mut self.backend {
+            GraphicsBackend::OpenGL(ctx) => ctx.set_color_write(color_write),
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(ctx) => ctx.set_color_write(color_write),
+        }
+    }
+
+    pub fn set_blend(&mut self, color_blend: Option<BlendState>, alpha_blend: Option<BlendState>) {
+        match &mut self.backend {
+            GraphicsBackend::OpenGL(ctx) => ctx.set_blend(color_blend, alpha_blend),
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(ctx) => ctx.set_blend(color_blend, alpha_blend),
+        }
+    }
+
+    pub fn set_stencil(&mut self, stencil_test: Option<StencilState>) {
+        match &mut self.backend {
+            GraphicsBackend::OpenGL(ctx) => ctx.set_stencil(stencil_test),
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(ctx) => ctx.set_stencil(stencil_test),
+        }
+    }
+
+    pub fn apply_viewport(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        match &mut self.backend {
+            GraphicsBackend::OpenGL(ctx) => ctx.apply_viewport(x, y, w, h),
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(ctx) => ctx.apply_viewport(x, y, w, h),
+        }
+    }
+
+    pub fn apply_scissor_rect(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        match &mut self.backend {
+            GraphicsBackend::OpenGL(ctx) => ctx.apply_scissor_rect(x, y, w, h),
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(ctx) => ctx.apply_scissor_rect(x, y, w, h),
+        }
+    }
+
+    pub fn apply_bindings(&mut self, bindings: &Bindings) {
+        match &mut self.backend {
+            GraphicsBackend::OpenGL(ctx) => ctx.apply_bindings(bindings),
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(ctx) => ctx.apply_bindings(bindings),
+        }
+    }
+
+    pub fn apply_uniforms<U>(&mut self, uniforms: &U) {
+        self.apply_uniforms_from_bytes(uniforms as *const _ as *const u8, std::mem::size_of::<U>())
+    }
+
+    #[doc(hidden)]
+    pub fn apply_uniforms_from_bytes(&mut self, uniform_ptr: *const u8, size: usize) {
+        match &mut self.backend {
+            GraphicsBackend::OpenGL(ctx) => ctx.apply_uniforms_from_bytes(uniform_ptr, size),
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(ctx) => ctx.apply_uniforms_from_bytes(uniform_ptr, size),
+        }
+    }
+
+    pub fn clear(
+        &mut self,
+        color: Option<(f32, f32, f32, f32)>,
+        depth: Option<f32>,
+        stencil: Option<i32>,
+    ) {
+        match &mut self.backend {
+            GraphicsBackend::OpenGL(ctx) => ctx.clear(color, depth, stencil),
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(ctx) => ctx.clear(color, depth, stencil),
+        }
+    }
+
+    /// start rendering to the default frame buffer
+    pub fn begin_default_pass(&mut self, action: PassAction) {
+        self.begin_pass(None, action);
+    }
+
+    /// start rendering to an offscreen framebuffer
+    pub fn begin_pass(&mut self, pass: impl Into<Option<RenderPass>>, action: PassAction) {
+        match &mut self.backend {
+            GraphicsBackend::OpenGL(ctx) => ctx.begin_pass(pass.into(), action),
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(ctx) => ctx.begin_pass(pass.into(), action),
+        }
+    }
+
+    pub fn end_render_pass(&mut self) {
+        match &mut self.backend {
+            GraphicsBackend::OpenGL(ctx) => ctx.end_render_pass(),
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(ctx) => ctx.end_render_pass(),
+        }
+    }
+
+    pub fn commit_frame(&mut self) {
+        match &mut self.backend {
+            GraphicsBackend::OpenGL(ctx) => ctx.commit_frame(),
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(ctx) => ctx.commit_frame(),
+        }
+    }
+
+    pub fn draw(&mut self, base_element: i32, num_elements: i32, num_instances: i32) {
+        match &mut self.backend {
+            GraphicsBackend::OpenGL(ctx) => ctx.draw(base_element, num_elements, num_instances),
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(ctx) => ctx.draw(base_element, num_elements, num_instances),
+        }
+    }
+
+    /// Copy the colour of one render target into another, scaling to fit.
+    pub fn copy_render_target(&mut self, src: RenderPass, dst: RenderPass) {
+        match &mut self.backend {
+            GraphicsBackend::OpenGL(ctx) => unsafe {
+                let (sw, sh) = (ctx.passes[src.0].texture.width as i32, ctx.passes[src.0].texture.height as i32);
+                let (w, h) = (ctx.passes[dst.0].texture.width as i32, ctx.passes[dst.0].texture.height as i32);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, ctx.passes[src.0].gl_fb);
+                glBindFramebuffer(GL_DRAW_FRAMEBUFFER, ctx.passes[dst.0].gl_fb);
+                glBlitFramebuffer(
+                    0,
+                    0,
+                    sw,
+                    sh,
+                    0,
+                    0,
+                    w,
+                    h,
+                    GL_COLOR_BUFFER_BIT,
+                    GL_LINEAR,
+                );
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+                glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+            },
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(ctx) => {
+                let src = ctx.passes[src.0]
+                    .as_ref()
+                    .expect("the render pass has been deleted")
+                    .color;
+                let dst = ctx.passes[dst.0]
+                    .as_ref()
+                    .expect("the render pass has been deleted")
+                    .color;
+                ctx.copy_texture(src.texture as usize, dst.texture as usize)
+            }
+        }
+    }
+
+    /// Called by the platform backend once per frame, after all draw calls. The
+    /// Vulkan backend presents here; OpenGL has already presented through the
+    /// platform swap chain.
+    pub(crate) fn swap_buffers(&mut self) {
+        #[cfg(feature = "vulkan")]
+        if let GraphicsBackend::Vulkan(ctx) = &mut self.backend {
+            ctx.present();
+        }
+    }
+
+    /// Release the backend's GPU resources before the window goes away.
+    pub(crate) fn cleanup_backend(&mut self) {
+        #[cfg(feature = "vulkan")]
+        if let GraphicsBackend::Vulkan(ctx) = &mut self.backend {
+            ctx.cleanup();
+        }
     }
 }
 
@@ -1082,9 +1559,11 @@ impl GraphicsContext {
 
     /// start rendering to an offscreen framebuffer
     pub fn begin_pass(&mut self, pass: impl Into<Option<RenderPass>>, action: PassAction) {
-        let (framebuffer, w, h) = match pass.into() {
+        let pass = pass.into();
+        let (framebuffer, w, h) = match pass {
             None => {
-                let (screen_width, screen_height) = self.screen_size();
+                let (screen_width, screen_height) =
+                    unsafe { &*self.display.unwrap() }.screen_size();
                 (
                     self.default_framebuffer,
                     screen_width as i32,
@@ -1100,6 +1579,7 @@ impl GraphicsContext {
                 )
             }
         };
+        self.cur_pass = pass;
         unsafe {
             glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
             glViewport(0, 0, w, h);
@@ -1118,6 +1598,29 @@ impl GraphicsContext {
     }
 
     pub fn end_render_pass(&mut self) {
+        if let Some(pass) = self.cur_pass.take() {
+            let pass = &self.passes[pass.0];
+            if pass.samples > 1 {
+                let (w, h) = (pass.texture.width as i32, pass.texture.height as i32);
+                let (from, to) = (pass.gl_fb, pass.resolve_gl_fb);
+                unsafe {
+                    glBindFramebuffer(GL_READ_FRAMEBUFFER, from);
+                    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, to);
+                    glBlitFramebuffer(
+                        0,
+                        0,
+                        w,
+                        h,
+                        0,
+                        0,
+                        w,
+                        h,
+                        GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT,
+                        GL_NEAREST,
+                    );
+                }
+            }
+        }
         unsafe {
             glBindFramebuffer(GL_FRAMEBUFFER, self.default_framebuffer);
             self.cache.bind_buffer(GL_ARRAY_BUFFER, 0, None);
@@ -1554,7 +2057,25 @@ impl Pipeline {
         Self::with_params(ctx, buffer_layout, attributes, shader, Default::default())
     }
 
-    pub fn with_params(
+pub fn with_params(
+        ctx: &mut Context,
+        buffer_layout: &[BufferLayout],
+        attributes: &[VertexAttribute],
+        shader: Shader,
+        params: PipelineParams,
+    ) -> Pipeline {
+        match ctx.backend() {
+            GraphicsBackend::OpenGL(_) => {
+                Pipeline::with_params_opengl(ctx, buffer_layout, attributes, shader, params)
+            }
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(_) => ctx
+                .vulkan()
+                .new_pipeline(buffer_layout, attributes, shader, params),
+        }
+    }
+
+    fn with_params_opengl(
         ctx: &mut Context,
         buffer_layout: &[BufferLayout],
         attributes: &[VertexAttribute],
@@ -1577,7 +2098,7 @@ impl Pipeline {
         } in attributes
         {
             let layout = buffer_layout.get(*buffer_index).unwrap_or_else(|| panic!());
-            let mut cache = buffer_cache
+            let cache = buffer_cache
                 .get_mut(*buffer_index)
                 .unwrap_or_else(|| panic!());
 
@@ -1590,7 +2111,7 @@ impl Pipeline {
             assert!(cache.stride <= 255);
         }
 
-        let program = ctx.shaders[shader.0].program;
+        let program = ctx.opengl().shaders[shader.0].program;
 
         let attributes_len = attributes
             .iter()
@@ -1608,7 +2129,7 @@ impl Pipeline {
             buffer_index,
         } in attributes
         {
-            let mut buffer_data = &mut buffer_cache
+            let buffer_data = &mut buffer_cache
                 .get_mut(*buffer_index)
                 .unwrap_or_else(|| panic!());
             let layout = buffer_layout.get(*buffer_index).unwrap_or_else(|| panic!());
@@ -1661,13 +2182,20 @@ impl Pipeline {
             params,
         };
 
+        let ctx = ctx.opengl();
         ctx.pipelines.push(pipeline);
         Pipeline(ctx.pipelines.len() - 1)
     }
 
     pub fn set_blend(&self, ctx: &mut Context, color_blend: Option<BlendState>) {
-        let mut pipeline = &mut ctx.pipelines[self.0];
-        pipeline.params.color_blend = color_blend;
+        match ctx.backend() {
+            GraphicsBackend::OpenGL(_) => {
+                let pipeline = &mut ctx.opengl().pipelines[self.0];
+                pipeline.params.color_blend = color_blend;
+            }
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(_) => ctx.vulkan().pipelines[self.0].params.color_blend = color_blend,
+        }
     }
 }
 
@@ -1759,25 +2287,45 @@ impl Buffer {
     /// ];
     /// let buffer = Buffer::immutable(ctx, BufferType::VertexBuffer, &vertices);
     /// ```
-    pub fn immutable<T>(ctx: &mut Context, buffer_type: BufferType, data: &[T]) -> Buffer {
+pub fn immutable<T>(ctx: &mut Context, buffer_type: BufferType, data: &[T]) -> Buffer {
         let index_type = if buffer_type == BufferType::IndexBuffer {
             Some(IndexType::for_type::<T>())
         } else {
             None
         };
 
+        let size = mem::size_of_val(data);
+
+        match ctx.backend() {
+            GraphicsBackend::OpenGL(_) => Buffer::immutable_opengl(ctx, buffer_type, index_type, data, size),
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(_) => ctx.vulkan().new_buffer(
+                buffer_type,
+                index_type,
+                size,
+                Some(data.as_ptr() as *const u8),
+            ),
+        }
+    }
+
+    fn immutable_opengl<T>(
+        ctx: &mut Context,
+        buffer_type: BufferType,
+        index_type: Option<IndexType>,
+        data: &[T],
+        size: usize,
+    ) -> Buffer {
         let gl_target = gl_buffer_target(&buffer_type);
         let gl_usage = gl_usage(&Usage::Immutable);
-        let size = mem::size_of_val(data);
         let mut gl_buf: u32 = 0;
 
         unsafe {
             glGenBuffers(1, &mut gl_buf as *mut _);
-            ctx.cache.store_buffer_binding(gl_target);
-            ctx.cache.bind_buffer(gl_target, gl_buf, index_type);
+            ctx.opengl().cache.store_buffer_binding(gl_target);
+            ctx.opengl().cache.bind_buffer(gl_target, gl_buf, index_type);
             glBufferData(gl_target, size as _, std::ptr::null() as *const _, gl_usage);
             glBufferSubData(gl_target, 0, size as _, data.as_ptr() as *const _);
-            ctx.cache.restore_buffer_binding(gl_target);
+            ctx.opengl().cache.restore_buffer_binding(gl_target);
         }
 
         Buffer {
@@ -1795,16 +2343,33 @@ impl Buffer {
             None
         };
 
+        match ctx.backend() {
+            GraphicsBackend::OpenGL(_) => {
+                Buffer::stream_opengl(ctx, buffer_type, index_type, size)
+            }
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(_) => {
+                ctx.vulkan().new_buffer(buffer_type, index_type, size, None)
+            }
+        }
+    }
+
+    fn stream_opengl(
+        ctx: &mut Context,
+        buffer_type: BufferType,
+        index_type: Option<IndexType>,
+        size: usize,
+    ) -> Buffer {
         let gl_target = gl_buffer_target(&buffer_type);
         let gl_usage = gl_usage(&Usage::Stream);
         let mut gl_buf: u32 = 0;
 
         unsafe {
             glGenBuffers(1, &mut gl_buf as *mut _);
-            ctx.cache.store_buffer_binding(gl_target);
-            ctx.cache.bind_buffer(gl_target, gl_buf, None);
+            ctx.opengl().cache.store_buffer_binding(gl_target);
+            ctx.opengl().cache.bind_buffer(gl_target, gl_buf, None);
             glBufferData(gl_target, size as _, std::ptr::null() as *const _, gl_usage);
-            ctx.cache.restore_buffer_binding(gl_target);
+            ctx.opengl().cache.restore_buffer_binding(gl_target);
         }
 
         Buffer {
@@ -1816,25 +2381,18 @@ impl Buffer {
     }
 
     pub fn index_stream(ctx: &mut Context, index_type: IndexType, size: usize) -> Buffer {
-        let gl_target = gl_buffer_target(&BufferType::IndexBuffer);
-        let gl_usage = gl_usage(&Usage::Stream);
-        let mut gl_buf: u32 = 0;
-
-        unsafe {
-            glGenBuffers(1, &mut gl_buf as *mut _);
-            ctx.cache.store_buffer_binding(gl_target);
-            ctx.cache.bind_buffer(gl_target, gl_buf, None);
-            glBufferData(gl_target, size as _, std::ptr::null() as *const _, gl_usage);
-            ctx.cache.restore_buffer_binding(gl_target);
-        }
-
-        Buffer {
-            gl_buf,
-            buffer_type: BufferType::IndexBuffer,
-            size,
-            index_type: Some(index_type),
+        match ctx.backend() {
+            GraphicsBackend::OpenGL(_) => {
+                Buffer::stream_opengl(ctx, BufferType::IndexBuffer, Some(index_type), size)
+            }
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(_) => {
+                ctx.vulkan()
+                    .new_buffer(BufferType::IndexBuffer, Some(index_type), size, None)
+            }
         }
     }
+
     pub fn update<T>(&self, ctx: &mut Context, data: &[T]) {
         if self.buffer_type == BufferType::IndexBuffer {
             assert!(self.index_type.is_some());
@@ -1845,12 +2403,21 @@ impl Buffer {
 
         assert!(size <= self.size);
 
-        let gl_target = gl_buffer_target(&self.buffer_type);
-        ctx.cache.store_buffer_binding(gl_target);
-        ctx.cache
-            .bind_buffer(gl_target, self.gl_buf, self.index_type);
-        unsafe { glBufferSubData(gl_target, 0, size as _, data.as_ptr() as *const _) };
-        ctx.cache.restore_buffer_binding(gl_target);
+        match ctx.backend() {
+            GraphicsBackend::OpenGL(_) => {
+                let gl_target = gl_buffer_target(&self.buffer_type);
+                let ctx = ctx.opengl();
+                ctx.cache.store_buffer_binding(gl_target);
+                ctx.cache
+                    .bind_buffer(gl_target, self.gl_buf, self.index_type);
+                unsafe { glBufferSubData(gl_target, 0, size as _, data.as_ptr() as *const _) };
+                ctx.cache.restore_buffer_binding(gl_target);
+            }
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(_) => ctx
+                .vulkan()
+                .update_buffer(self.gl_buf as usize, data.as_ptr() as *const u8, size),
+        }
     }
 
     /// Size of buffer in bytes
@@ -1862,11 +2429,14 @@ impl Buffer {
     ///
     /// More high-level code on top of miniquad probably is going to call this in Drop implementation of some
     /// more RAII buffer object.
-    ///
-    /// There is no protection against using deleted textures later. However its not an UB in OpenGl and thats why
-    /// this function is not marked as unsafe
-    pub fn delete(&self) {
-        unsafe { glDeleteBuffers(1, &self.gl_buf as *const _) }
+    pub fn delete(&self, ctx: &mut Context) {
+        match ctx.backend() {
+            GraphicsBackend::OpenGL(_) => {
+                unsafe { glDeleteBuffers(1, &self.gl_buf as *const _) }
+            }
+            #[cfg(feature = "vulkan")]
+            GraphicsBackend::Vulkan(_) => ctx.vulkan().delete_buffer(self.gl_buf as usize),
+        }
     }
 }
 
