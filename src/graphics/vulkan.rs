@@ -271,6 +271,17 @@ impl VulkanContext {
         window: RawWindowHandle,
         window_size: (u32, u32),
     ) -> VulkanContext {
+        Self::create(Some((display, window)), window_size)
+    }
+
+    pub fn new_headless(window_size: (u32, u32)) -> VulkanContext {
+        Self::create(None, window_size)
+    }
+
+    fn create(
+        window_handle: Option<(RawDisplayHandle, RawWindowHandle)>,
+        window_size: (u32, u32),
+    ) -> VulkanContext {
         unsafe {
             let entry = Entry::load().expect("Failed to load the Vulkan loader");
             let app_name = CStr::from_bytes_with_nul_unchecked(b"miniquad\0");
@@ -290,8 +301,12 @@ impl VulkanContext {
                 Vec::new()
             };
 
-            let mut extension_names =
-                ash_window::enumerate_required_extensions(display).unwrap().to_vec();
+            let mut extension_names = match window_handle {
+                Some((display, _)) => ash_window::enumerate_required_extensions(display)
+                    .unwrap()
+                    .to_vec(),
+                None => Vec::new(),
+            };
             if validation {
                 extension_names.push(DebugUtils::name().as_ptr());
             }
@@ -339,8 +354,13 @@ impl VulkanContext {
                 None
             };
 
-            let surface = ash_window::create_surface(&entry, &instance, display, window, None)
-                .expect("Failed to create a Vulkan surface for the window");
+            let surface = match window_handle {
+                Some((display, window)) => {
+                    ash_window::create_surface(&entry, &instance, display, window, None)
+                        .expect("Failed to create a Vulkan surface for the window")
+                }
+                None => vk::SurfaceKHR::null(),
+            };
 
             let surface_loader = Surface::new(&entry, &instance);
 
@@ -357,13 +377,14 @@ impl VulkanContext {
                         .enumerate()
                         .find_map(|(index, info)| {
                             let graphics_and_surface = info.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-                                && surface_loader
-                                    .get_physical_device_surface_support(
-                                        *device,
-                                        index as u32,
-                                        surface,
-                                    )
-                                    .unwrap();
+                                && (surface.as_raw() == 0
+                                    || surface_loader
+                                        .get_physical_device_surface_support(
+                                            *device,
+                                            index as u32,
+                                            surface,
+                                        )
+                                        .unwrap());
                             if graphics_and_surface {
                                 Some((*device, index as u32))
                             } else {
@@ -397,7 +418,10 @@ impl VulkanContext {
                 None
             };
 
-            let mut device_extension_names = vec![Swapchain::name().as_ptr()];
+            let mut device_extension_names = Vec::new();
+            if surface.as_raw() != 0 {
+                device_extension_names.push(Swapchain::name().as_ptr());
+            }
             if video_queue_supported {
                 device_extension_names.push(cstr("VK_KHR_video_queue").as_ptr());
                 device_extension_names.push(cstr("VK_KHR_video_encode_queue").as_ptr());
@@ -583,7 +607,11 @@ impl VulkanContext {
             );
             context.create_uniform_arenas();
             context.create_stream_arenas();
-            context.create_swapchain(window_size);
+            if surface.as_raw() == 0 {
+                context.enable_offscreen_video();
+            } else {
+                context.create_swapchain(window_size);
+            }
             context
         }
     }

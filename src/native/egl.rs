@@ -21,6 +21,7 @@ pub use core::ptr::null_mut;
 pub const EGL_SUCCESS: u32 = 12288;
 
 pub const EGL_WINDOW_BIT: u32 = 4;
+pub const EGL_PBUFFER_BIT: u32 = 1;
 
 pub const EGL_ALPHA_SIZE: u32 = 12321;
 pub const EGL_BLUE_SIZE: u32 = 12322;
@@ -262,6 +263,16 @@ pub unsafe fn create_egl_context(
     display: *mut std::ffi::c_void,
     alpha: bool,
 ) -> Result<(EGLContext, EGLConfig, EGLDisplay), EglError> {
+    create_egl_context_surface(egl, display, alpha, EGL_WINDOW_BIT)
+        .map(|(context, config, display, _)| (context, config, display))
+}
+
+pub unsafe fn create_egl_context_surface(
+    egl: &mut LibEgl,
+    display: *mut std::ffi::c_void,
+    alpha: bool,
+    surface_type: u32,
+) -> Result<(EGLContext, EGLConfig, EGLDisplay, i32), EglError> {
     let display = (egl.eglGetDisplay.unwrap())(display as _);
     if display == /* EGL_NO_DISPLAY */ null_mut() {
         return Err(EglError::NoDisplay);
@@ -274,7 +285,7 @@ pub unsafe fn create_egl_context(
     let alpha_size = if alpha { 8 } else { 0 };
     #[rustfmt::skip]
     let cfg_attributes = vec![
-        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_SURFACE_TYPE, surface_type,
         EGL_RED_SIZE, 8,
         EGL_GREEN_SIZE, 8,
         EGL_BLUE_SIZE, 8,
@@ -327,16 +338,24 @@ pub unsafe fn create_egl_context(
     if !exact_cfg_found {
         config = available_cfgs[0];
     }
-    let ctx_attributes = vec![EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE];
-    let context = (egl.eglCreateContext.unwrap())(
-        display,
-        config,
-        /* EGL_NO_CONTEXT */ null_mut(),
-        ctx_attributes.as_ptr() as _,
-    );
+    let mut major: i32 = 2;
+    let mut context = null_mut();
+    for version in [3i32, 2] {
+        let ctx_attributes = vec![EGL_CONTEXT_CLIENT_VERSION, version as u32, EGL_NONE];
+        context = (egl.eglCreateContext.unwrap())(
+            display,
+            config,
+            /* EGL_NO_CONTEXT */ null_mut(),
+            ctx_attributes.as_ptr() as _,
+        );
+        if !context.is_null() {
+            major = version;
+            break;
+        }
+    }
     if context.is_null() {
         return Err(EglError::CreateContextFailed);
     }
 
-    return Ok((context, config, display));
+    return Ok((context, config, display, major));
 }

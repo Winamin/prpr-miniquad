@@ -55,6 +55,37 @@ pub trait NativeDisplay: std::any::Any {
     fn as_any(&mut self) -> &mut dyn std::any::Any;
 }
 
+pub struct HeadlessDisplay {
+    pub size: (f32, f32),
+}
+
+impl NativeDisplay for HeadlessDisplay {
+    fn screen_size(&self) -> (f32, f32) {
+        self.size
+    }
+    fn dpi_scale(&self) -> f32 {
+        1.
+    }
+    fn high_dpi(&self) -> bool {
+        false
+    }
+    fn order_quit(&mut self) {}
+    fn request_quit(&mut self) {}
+    fn cancel_quit(&mut self) {}
+    fn set_cursor_grab(&mut self, _grab: bool) {}
+    fn show_mouse(&mut self, _shown: bool) {}
+    fn set_mouse_cursor(&mut self, _cursor_icon: crate::CursorIcon) {}
+    fn set_window_size(&mut self, _new_width: u32, _new_height: u32) {}
+    fn set_fullscreen(&mut self, _fullscreen: bool) {}
+    fn clipboard_get(&mut self) -> Option<String> {
+        None
+    }
+    fn clipboard_set(&mut self, _data: &str) {}
+    fn as_any(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
 pub mod module;
 
 #[cfg(target_env = "ohos")]

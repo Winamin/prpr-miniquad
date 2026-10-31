@@ -720,7 +720,16 @@ impl RenderPass {
                 glRenderbufferStorageMultisample(
                     GL_RENDERBUFFER,
                     samples as i32,
-                    GL_RGBA8,
+                    // GLES requires identical formats for an MSAA resolve.
+                    // The chart renderer uses RGB8 targets, while UI targets
+                    // use RGBA8; always allocating RGBA8 loses the chart.
+                    match resolve_img.format {
+                        TextureFormat::RGB8 => GL_RGB8,
+                        TextureFormat::RGBA8 => GL_RGBA8,
+                        TextureFormat::Alpha => GL_R8,
+                        TextureFormat::LuminanceAlpha => GL_RG8,
+                        TextureFormat::Depth => panic!("MSAA colour target cannot be a depth texture"),
+                    },
                     resolve_img.width as i32,
                     resolve_img.height as i32,
                 );
@@ -921,6 +930,35 @@ pub enum GraphicsBackend {
     Vulkan(vulkan::VulkanContext),
 }
 
+/// Stand-in for the Vulkan context when the backend is not compiled in.
+#[cfg(not(feature = "vulkan"))]
+pub struct VulkanStub {
+    pub frame_wait_ns: u64,
+}
+
+#[cfg(not(feature = "vulkan"))]
+impl VulkanStub {
+    pub fn begin_offscreen_frame(&mut self) -> usize {
+        0
+    }
+
+    pub fn record_yuv_copy_to_staging(
+        &mut self,
+        _y_index: usize,
+        _uv_index: usize,
+        _staging_buffer_raw: u64,
+        _width: u32,
+        _height: u32,
+    ) {
+    }
+
+    pub fn finish_offscreen_frame(&mut self) {}
+
+    pub fn wait_offscreen_idle(&mut self) {}
+
+    pub fn copy_nv12_from_textures(&mut self, _y_index: usize, _uv_index: usize, _nv12_raw: u64) {}
+}
+
 /// The graphics context handed to the application. Dispatches every call to the
 /// backend selected by [`conf::RenderingBackend`](crate::conf::RenderingBackend).
 pub struct Context {
@@ -949,19 +987,28 @@ impl Context {
             },
             #[cfg(feature = "vulkan")]
             crate::conf::RenderingBackend::Vulkan => {
-                let (display, handle) =
-                    window.expect("The Vulkan backend requires raw window handles");
+                let vulkan_context = match window {
+                    Some((display, handle)) => {
+                        vulkan::VulkanContext::new(display, handle, window_size)
+                    }
+                    None => vulkan::VulkanContext::new_headless(window_size),
+                };
+                let display = if window.is_some() {
+                    None
+                } else {
+                    let headless: &'static mut crate::native::HeadlessDisplay =
+                        Box::leak(Box::new(crate::native::HeadlessDisplay {
+                            size: (window_size.0 as f32, window_size.1 as f32),
+                        }));
+                    Some(headless as *mut dyn crate::NativeDisplay)
+                };
                 Context {
-                    backend: GraphicsBackend::Vulkan(vulkan::VulkanContext::new(
-                        display,
-                        handle,
-                        window_size,
-                    )),
+                    backend: GraphicsBackend::Vulkan(vulkan_context),
                     features: Features {
                         instancing: true,
                         alpha_texture: false,
                     },
-                    display: None,
+                    display,
                 }
             }
             #[cfg(not(feature = "vulkan"))]
@@ -1010,6 +1057,11 @@ impl Context {
             }
             GraphicsBackend::OpenGL(_) => None,
         }
+    }
+
+    #[cfg(not(feature = "vulkan"))]
+    pub fn vulkan_context(&mut self) -> Option<&mut VulkanStub> {
+        None
     }
 
     #[cfg(feature = "vulkan")]
@@ -1620,6 +1672,9 @@ impl GraphicsContext {
                 unsafe {
                     glBindFramebuffer(GL_READ_FRAMEBUFFER, from);
                     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, to);
+                    // Resolve the entire colour target, independent of the
+                    // scissor used by the last draw. This pass has no depth.
+                    glScissor(0, 0, w, h);
                     glBlitFramebuffer(
                         0,
                         0,
@@ -1629,7 +1684,7 @@ impl GraphicsContext {
                         0,
                         w,
                         h,
-                        GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT,
+                        GL_COLOR_BUFFER_BIT,
                         GL_NEAREST,
                     );
                 }

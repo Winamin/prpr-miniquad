@@ -243,6 +243,9 @@ pub trait EventHandler {
     /// Right now is only implemented on Android, and is called on a Resume ndk callback
     fn window_restored_event(&mut self, _ctx: &mut Context) {}
 
+    /// Release resources on the rendering thread before its graphics context is destroyed.
+    fn destroy_event(&mut self, _ctx: &mut Context) {}
+
     /// This event is sent when the userclicks the window's close button
     /// or application code calls the ctx.request_quit() function. The event
     /// handler callback code can handle this event by calling

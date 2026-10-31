@@ -70,4 +70,4 @@ raw-window-handle = "0.5"
 gpu-allocator = { version = "0.26", default-features = false, features = [
     "vulkan",
 ], optional = true }
-shaderc = { version = "0.10", features = ["build-from-source"], optional = true }
+shaderc = { version = "0.10", optional = true }

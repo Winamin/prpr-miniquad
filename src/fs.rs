@@ -55,24 +55,47 @@ pub fn load_file<F: Fn(Response) + 'static>(path: &str, on_loaded: F) {
 }
 
 #[cfg(target_os = "android")]
+static ASSET_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "android")]
+pub fn set_asset_dir<P: Into<std::path::PathBuf>>(path: P) {
+    let _ = ASSET_DIR.set(path.into());
+}
+
+#[cfg(target_os = "android")]
 fn load_file_android<F: Fn(Response)>(path: &str, on_loaded: F) {
     fn load_file_sync(path: &str) -> Response {
+        if let Some(dir) = ASSET_DIR.get() {
+            let full = dir.join(path);
+            if let Ok(data) = std::fs::read(&full) {
+                return Ok(data);
+            }
+        }
+
         use crate::native;
 
-        let filename = std::ffi::CString::new(path).unwrap();
+        for candidate in [
+            path,
+            &format!("assets/{path}"),
+            &format!("assets/assets/{path}"),
+        ] {
+            let filename = std::ffi::CString::new(candidate).unwrap();
 
-        let mut data: native::android_asset = unsafe { std::mem::zeroed() };
+            let mut data: native::android_asset = unsafe { std::mem::zeroed() };
 
-        unsafe { native::android::load_asset(filename.as_ptr(), &mut data as _) };
+            unsafe { native::android::load_asset(filename.as_ptr(), &mut data as _) };
 
-        if data.content.is_null() == false {
-            let slice =
-                unsafe { std::slice::from_raw_parts(data.content, data.content_length as _) };
-            let response = slice.iter().map(|c| *c as _).collect::<Vec<_>>();
-            Ok(response)
-        } else {
-            Err(Error::AndroidAssetLoadingError)
+            if data.content.is_null() == false {
+                let slice = unsafe {
+                    std::slice::from_raw_parts(data.content, data.content_length as _)
+                };
+                let response = slice.iter().map(|c| *c as _).collect::<Vec<_>>();
+                unsafe { libc::free(data.content as *mut _); }
+                return Ok(response);
+            }
         }
+
+        Err(Error::AndroidAssetLoadingError)
     }
 
     let response = load_file_sync(path);

@@ -2,7 +2,7 @@ use crate::{
     event::{EventHandler, KeyCode, TouchPhase},
     native::egl::{self, LibEgl},
     native::NativeDisplay,
-    GraphicsContext,
+    Context,
 };
 
 use std::{cell::RefCell, sync::mpsc, thread};
@@ -74,12 +74,13 @@ unsafe impl Send for Message {}
 
 thread_local! {
     static MESSAGES_TX: RefCell<Option<mpsc::Sender<Message>>> = RefCell::new(None);
+    static RENDER_THREAD: RefCell<Option<thread::JoinHandle<()>>> = RefCell::new(None);
 }
 
 fn send_message(message: Message) {
     MESSAGES_TX.with(|tx| {
         let mut tx = tx.borrow_mut();
-        let _ = tx.as_mut().unwrap().send(message);
+        if let Some(tx) = tx.as_mut() { let _ = tx.send(message); }
     })
 }
 
@@ -208,7 +209,7 @@ pub unsafe fn console_error(msg: *const ::std::os::raw::c_char) {
 
 struct MainThreadState {
     libegl: LibEgl,
-    context: GraphicsContext,
+    context: Context,
     egl_display: egl::EGLDisplay,
     egl_config: egl::EGLConfig,
     egl_context: egl::EGLContext,
@@ -423,30 +424,40 @@ where
 
     MESSAGES_TX.with(move |messages_tx| *messages_tx.borrow_mut() = Some(tx));
 
-    thread::spawn(move || {
+    let render_thread = thread::spawn(move || {
         let mut libegl = LibEgl::try_load().expect("Cant load LibEGL");
 
         // skip all the messages until android will be able to actually open a window
         //
         // sometimes before launching an app android will show a permission dialog
         // it is important to create GL context only after a first SurfaceChanged
-        let (window, screen_width, screen_height) = 'a: loop {
-            match rx.try_recv() {
-                Ok(Message::SurfaceChanged {
-                    window,
-                    width,
-                    height,
-                }) => {
-                    break 'a (window, width as f32, height as f32);
+        let (window, screen_width, screen_height) = if conf.headless {
+            (std::ptr::null_mut(), conf.window_width as f32, conf.window_height as f32)
+        } else {
+            let mut ready = None;
+            while ready.is_none() {
+                match rx.recv() {
+                    Ok(Message::SurfaceChanged { window, width, height }) => {
+                        ready = Some((window, width as f32, height as f32));
+                    }
+                    Ok(Message::SurfaceCreated { window }) => ndk_sys::ANativeWindow_release(window),
+                    Ok(Message::Destroy) | Err(_) => return,
+                    _ => {}
                 }
-                _ => {}
             }
+            ready.unwrap()
         };
 
-        let (egl_context, egl_config, egl_display) = crate::native::egl::create_egl_context(
+        let surface_type = if conf.headless {
+            egl::EGL_PBUFFER_BIT
+        } else {
+            egl::EGL_WINDOW_BIT | egl::EGL_PBUFFER_BIT
+        };
+        let (egl_context, egl_config, egl_display, _es_major) = crate::native::egl::create_egl_context_surface(
             &mut libegl,
             std::ptr::null_mut(), /* EGL_DEFAULT_DISPLAY */
             conf.platform.framebuffer_alpha,
+            surface_type,
         )
         .expect("Cant create EGL context");
 
@@ -458,18 +469,37 @@ where
             libegl.eglGetProcAddress.expect("non-null function pointer")(name.as_ptr() as _)
         });
 
-        let surface = (libegl.eglCreateWindowSurface.unwrap())(
-            egl_display,
-            egl_config,
-            window as _,
-            std::ptr::null_mut(),
-        );
+        let surface = if conf.headless {
+            #[rustfmt::skip]
+            let attribs = [
+                egl::EGL_WIDTH, screen_width as u32,
+                egl::EGL_HEIGHT, screen_height as u32,
+                egl::EGL_NONE,
+            ];
+            (libegl.eglCreatePbufferSurface.unwrap())(
+                egl_display,
+                egl_config,
+                attribs.as_ptr() as _,
+            )
+        } else {
+            (libegl.eglCreateWindowSurface.unwrap())(
+                egl_display,
+                egl_config,
+                window as _,
+                std::ptr::null_mut(),
+            )
+        };
 
         if (libegl.eglMakeCurrent.unwrap())(egl_display, surface, surface, egl_context) == 0 {
             panic!();
         }
 
-        let mut context = GraphicsContext::new(gl::is_gl2());
+        let mut context = Context::new(
+            crate::conf::RenderingBackend::OpenGL,
+            gl::is_gl2(),
+            None,
+            (screen_width as _, screen_height as _),
+        );
 
         let mut display = AndroidDisplay {
             screen_width,
@@ -496,11 +526,20 @@ where
                 s.process_message(msg);
             }
 
+            if s.quit { break; }
             s.frame();
+            if s.surface.is_null() { thread::sleep(std::time::Duration::from_millis(16)); }
 
             thread::yield_now();
         }
 
+        // SurfaceView may have already gone away. Keep EGL current while releasing GPU resources.
+        if s.surface.is_null() {
+            let attributes = [egl::EGL_WIDTH, 1, egl::EGL_HEIGHT, 1, egl::EGL_NONE];
+            s.surface = (s.libegl.eglCreatePbufferSurface.unwrap())(s.egl_display, s.egl_config, attributes.as_ptr() as _);
+            (s.libegl.eglMakeCurrent.unwrap())(s.egl_display, s.surface, s.surface, s.egl_context);
+        }
+        s.event_handler.destroy_event(s.context.with_display(&mut s.display));
         (s.libegl.eglMakeCurrent.unwrap())(
             s.egl_display,
             std::ptr::null_mut(),
@@ -510,7 +549,12 @@ where
         (s.libegl.eglDestroySurface.unwrap())(s.egl_display, s.surface);
         (s.libegl.eglDestroyContext.unwrap())(s.egl_display, s.egl_context);
         (s.libegl.eglTerminate.unwrap())(s.egl_display);
+        if !s.window.is_null() { ndk_sys::ANativeWindow_release(s.window); }
+        drop(s);
+        // This is a native rendering thread; ART requires detaching before it exits.
+        (**VM).DetachCurrentThread.unwrap()(VM);
     });
+    RENDER_THREAD.with(|thread| *thread.borrow_mut() = Some(render_thread));
 }
 
 #[no_mangle]
@@ -578,6 +622,15 @@ unsafe extern "C" fn Java_quad_1native_QuadNative_activityOnDestroy(
     _: ndk_sys::jobject,
 ) {
     send_message(Message::Destroy);
+    RENDER_THREAD.with(|thread| {
+        if let Some(thread) = thread.borrow_mut().take() { let _ = thread.join(); }
+    });
+    MESSAGES_TX.with(|sender| *sender.borrow_mut() = None);
+    let env = attach_jni_env();
+    if !ACTIVITY.is_null() {
+        (**env).DeleteGlobalRef.unwrap()(env, ACTIVITY);
+        ACTIVITY = std::ptr::null_mut();
+    }
 }
 
 #[no_mangle]
@@ -697,7 +750,24 @@ extern "C" {
 }
 
 pub(crate) unsafe fn load_asset(filepath: *const ::std::os::raw::c_char, out: *mut android_asset) {
-    let env = attach_jni_env();
+    let mut env: *mut ndk_sys::JNIEnv = std::ptr::null_mut();
+    let mut activity: ndk_sys::jobject = ACTIVITY;
+
+    if !ndk_context::android_context().vm().is_null() {
+        let context = ndk_context::android_context();
+        let vm = context.vm() as *mut ndk_sys::JavaVM;
+        let attach_current_thread = (**vm).AttachCurrentThread.unwrap();
+        if attach_current_thread(vm, &mut env, std::ptr::null_mut()) != 0 {
+            return;
+        }
+        activity = context.context() as ndk_sys::jobject;
+    } else if !VM.is_null() {
+        env = attach_jni_env();
+    }
+
+    if env.is_null() || activity.is_null() {
+        return;
+    }
 
     let get_method_id = (**env).GetMethodID.unwrap();
     let get_object_class = (**env).GetObjectClass.unwrap();
@@ -705,23 +775,32 @@ pub(crate) unsafe fn load_asset(filepath: *const ::std::os::raw::c_char, out: *m
 
     let mid = (get_method_id)(
         env,
-        get_object_class(env, ACTIVITY),
+        get_object_class(env, activity),
         b"getAssets\0".as_ptr() as _,
         b"()Landroid/content/res/AssetManager;\0".as_ptr() as _,
     );
-    let asset_manager = (call_object_method)(env, ACTIVITY, mid);
+    if mid.is_null() {
+        return;
+    }
+    let asset_manager = (call_object_method)(env, activity, mid);
+    if asset_manager.is_null() {
+        return;
+    }
     let mgr = AAssetManager_fromJava(env, asset_manager);
+    if mgr.is_null() {
+        return;
+    }
     let asset = ndk_sys::AAssetManager_open(mgr, filepath, ndk_sys::AASSET_MODE_BUFFER as _);
     if asset.is_null() {
         return;
     }
     let length = ndk_sys::AAsset_getLength64(asset);
-    // TODO: memory leak right here! this buffer would never freed
     let buffer = libc::malloc(length as _);
-    if ndk_sys::AAsset_read(asset, buffer, length as _) > 0 {
-        ndk_sys::AAsset_close(asset);
-
+    if !buffer.is_null() && ndk_sys::AAsset_read(asset, buffer, length as _) == length as i32 {
         (*out).content_length = length as _;
         (*out).content = buffer as _;
+    } else {
+        libc::free(buffer);
     }
+    ndk_sys::AAsset_close(asset);
 }

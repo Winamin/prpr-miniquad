@@ -117,13 +117,36 @@ impl VulkanContext {
         self.frame_wait_pending = false;
         self.cmd_dirty = false;
         self.frame_submitted = true;
+
+        if self.offscreen {
+            unsafe {
+                self.device
+                    .queue_wait_idle(self.graphics_queue)
+                    .expect("Failed to drain the mid-frame submission");
+                self.device
+                    .reset_command_buffer(
+                        command_buffer,
+                        vk::CommandBufferResetFlags::RELEASE_RESOURCES,
+                    )
+                    .expect("Failed to reset the offscreen command buffer");
+                self.device
+                    .begin_command_buffer(
+                        command_buffer,
+                        &vk::CommandBufferBeginInfo::builder()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    )
+                    .expect("Failed to begin the offscreen command buffer");
+            }
+            self.frame_submitted = false;
+            self.recording = true;
+        }
         true
     }
 
     /// Release the per-frame pools and start recording again, after the GPU has
     /// finished the submission `flush_recording` made.
     pub(crate) fn release_frame_resources(&mut self) {
-        if !self.frame_submitted || !self.frame_active {
+        if !self.frame_submitted || !self.frame_active || self.offscreen {
             return;
         }
         let image_index = self.acquired_image.unwrap();
@@ -329,12 +352,20 @@ impl VulkanContext {
     /// The previous use of this slot is waited on here; that is the only
     /// per-frame stall, and it is `MAX_FRAMES_IN_FLIGHT - 1` frames behind the
     /// frame currently being recorded.
+    pub fn is_frame_active(&self) -> bool {
+        self.frame_active
+    }
+
     pub fn begin_offscreen_frame(&mut self) -> usize {
         assert!(self.offscreen, "enable_offscreen_video() was not called");
         assert!(
             !self.frame_active,
             "the previous offscreen frame was not finished"
         );
+        self.start_offscreen_frame()
+    }
+
+    fn start_offscreen_frame(&mut self) -> usize {
         let slot = self.current_frame;
         unsafe {
             let fence = self.in_flight[slot];
@@ -786,7 +817,11 @@ impl VulkanContext {
             return;
         }
         if !self.frame_active {
-            self.begin_frame();
+            if self.offscreen {
+                self.start_offscreen_frame();
+            } else {
+                self.begin_frame();
+            }
         }
         let target = pass.map(|pass| pass.0);
         // MiniQuad's passes only rebind the target: everything drawn between two
@@ -919,6 +954,23 @@ impl VulkanContext {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: vk::Extent2D { width, height },
         };
+        if std::env::var_os("MINIQUAD_VULKAN_TRACE").is_some() {
+            let image = self.acquired_image.unwrap_or(usize::MAX);
+            eprintln!(
+                "[trace] begin_pass target={:?} image={} cb={:#x} pass_open={} color_view={:#x} size={}x{}",
+                target,
+                image,
+                if image < self.command_buffers.len() {
+                    self.command_buffers[image].as_raw()
+                } else {
+                    0
+                },
+                self.pass_open,
+                color_view.as_raw(),
+                width,
+                height
+            );
+        }
         let rendering_info = vk::RenderingInfo {
             render_area: area,
             layer_count: 1,
