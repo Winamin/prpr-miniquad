@@ -158,12 +158,22 @@ impl VulkanContext {
     }
 
     fn begin_frame(&mut self) {
+        let mut prepared = if let Some(worker) = &mut self.submission {
+            let (image, recreate) = worker.wait_prepared()
+                .expect("Failed to submit or acquire the next frame");
+            self.presentation_needs_recreate |= recreate;
+            image
+        } else {
+            None
+        };
         unsafe {
             let fence = self.in_flight[self.current_frame];
             let wait_start = std::time::Instant::now();
-            self.device
-                .wait_for_fences(&[fence], true, std::u64::MAX)
-                .expect("Failed to wait for the frame fence");
+            {
+                self.device
+                    .wait_for_fences(&[fence], true, std::u64::MAX)
+                    .expect("Failed to wait for the frame fence");
+            }
             self.frame_wait_ns = self
                 .frame_wait_ns
                 .saturating_add(wait_start.elapsed().as_nanos() as u64);
@@ -183,22 +193,28 @@ impl VulkanContext {
             }
             self.stream_arenas[slot].offset = 0;
 
-            // Host access to the swapchain is externally synchronized: this
-            // thread's `vkAcquireNextImageKHR` must not run concurrently with
-            // the submission worker's `vkQueuePresentKHR` on the same
-            // swapchain. A finished frame fence only proves the GPU commands
-            // completed; it does not prove the previous `vkQueuePresentKHR`
-            // host call returned. Drain the worker (queue_submit +
-            // queue_present) before touching the swapchain; racing the two
-            // calls makes drivers return spurious `VK_NOT_READY` or deadlock
-            // internally.
-            self.drain_submissions();
-            if self.presentation_needs_recreate {
-                self.recreate_swapchain();
+            // A prepared image was acquired by the worker before it started
+            // presenting. Recording into it accesses neither the queue nor
+            // the swapchain. If acquisition did not find a free image, reclaim
+            // host ownership before acquiring here; a GPU fence alone does
+            // not synchronize this thread with the worker's present call.
+            if prepared.is_none() || self.presentation_needs_recreate {
+                self.drain_submissions();
+                if self.presentation_needs_recreate {
+                    prepared = None;
+                    self.recreate_swapchain();
+                }
             }
 
             let (image_index, slot, suboptimal) = loop {
                 let slot = self.acquire_slot;
+                if let Some(image) = prepared.take() {
+                    assert_eq!(image.swapchain, self.swapchain,
+                        "prepared image belongs to an old swapchain");
+                    assert_eq!(image.semaphore, self.image_available[slot],
+                        "prepared image used an unexpected semaphore");
+                    break (image.image_index, slot, image.suboptimal);
+                }
                 match self.swapchain_loader.acquire_next_image(
                     self.swapchain,
                     std::u64::MAX,
@@ -1584,7 +1600,14 @@ impl VulkanContext {
             fence: self.in_flight[self.current_frame],
             swapchain: self.swapchain,
             image_index: image_index as u32,
-            next_acquire: None,
+            // begin_frame waited on this slot's fence, which also retires any
+            // older submission that used the next round-robin semaphore.
+            next_acquire: self.submission.as_ref()
+                // With fewer images, the next semaphore can still be used by
+                // the other frame slot. Keep the drained acquisition path.
+                .filter(|worker| worker.preacquire_enabled()
+                    && self.image_available.len() > MAX_FRAMES_IN_FLIGHT)
+                .map(|_| self.image_available[self.acquire_slot]),
         };
         if let Some(worker) = &mut self.submission {
             worker.submit(submission);
@@ -1600,8 +1623,7 @@ impl VulkanContext {
         self.current_frame = (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
         self.recording = false;
         self.frame_active = false;
-        // Host completion is consumed at the next use of this frame slot.
-        // Rebuilding a suboptimal swapchain is deferred to begin_frame, where
-        // the presentation worker is drained before swapchain handles change.
+        // The next frame can consume its acquired image before this present
+        // returns. Rebuilding still drains the worker before handles change.
     }
 }

@@ -747,6 +747,9 @@ impl VulkanContext {
     /// (Re)create the swap chain and everything derived from it.
     fn create_swapchain(&mut self, window_size: (u32, u32)) {
         self.drain_submissions();
+        if let Some(worker) = &mut self.submission {
+            worker.discard_prepared();
+        }
         self.presentation_needs_recreate = false;
         self.swapchain_suboptimal = false;
         unsafe {
