@@ -3,6 +3,9 @@ mod event;
 pub mod fs;
 pub mod graphics;
 
+#[cfg(feature = "tracy")]
+pub mod tracy;
+
 pub mod native;
 
 #[cfg(target_env = "ohos")]

@@ -158,6 +158,8 @@ impl VulkanContext {
     }
 
     fn begin_frame(&mut self) {
+        #[cfg(feature = "tracy")]
+        let _span = crate::tracy::span_with_callstack(crate::tracy::span_location!("Vulkan::begin_frame"));
         let mut prepared = if let Some(worker) = &mut self.submission {
             let (image, recreate) = worker.wait_prepared()
                 .expect("Failed to submit or acquire the next frame");
@@ -170,6 +172,8 @@ impl VulkanContext {
             let fence = self.in_flight[self.current_frame];
             let wait_start = std::time::Instant::now();
             {
+                #[cfg(feature = "tracy")]
+                let _span = crate::tracy::span_with_callstack(crate::tracy::span_location!("Vulkan::wait_frame_fence (wall time)"));
                 self.device
                     .wait_for_fences(&[fence], true, std::u64::MAX)
                     .expect("Failed to wait for the frame fence");
@@ -215,6 +219,8 @@ impl VulkanContext {
                         "prepared image used an unexpected semaphore");
                     break (image.image_index, slot, image.suboptimal);
                 }
+                #[cfg(feature = "tracy")]
+                let _span = crate::tracy::span_with_callstack(crate::tracy::span_location!("Vulkan::acquire_next_image (wall time)"));
                 match self.swapchain_loader.acquire_next_image(
                     self.swapchain,
                     std::u64::MAX,
@@ -991,6 +997,8 @@ impl VulkanContext {
     }
 
     pub fn flush_draw_commands(&mut self) {
+        #[cfg(feature = "tracy")]
+        let _span = crate::tracy::span(crate::tracy::span_location!("Vulkan::flush_draw_commands"));
         if self.recorder.enabled() && self.frame_active {
             if self.pass_open {
                 self.recorder.batch(self.cur_color_format, self.cur_depth_format, self.cur_samples);
@@ -1549,6 +1557,8 @@ impl VulkanContext {
     pub fn commit_frame(&mut self) {}
 
     pub fn present(&mut self) {
+        #[cfg(feature = "tracy")]
+        let _span = crate::tracy::span_with_callstack(crate::tracy::span_location!("Vulkan::present"));
         if !self.frame_active {
             return;
         }

@@ -244,7 +244,7 @@ impl RecordingFrame {
     ) -> vk::DescriptorSet {
         loop {
             if self.descriptor_pool == self.descriptor_pools.len() {
-                const SETS: u32 = 512;
+                const SETS: u32 = 512; // The pool notes(max)
                 let sizes = [
                     vk::DescriptorPoolSize {
                         ty: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
@@ -287,6 +287,8 @@ impl RecordingFrame {
         depth: Option<vk::Format>,
         samples: u32,
     ) -> vk::CommandBuffer {
+        #[cfg(feature = "tracy")]
+        let _span = crate::tracy::span(crate::tracy::span_location!("Vulkan::record_secondary"));
         let command_buffer = self.command_buffer(device);
         let formats = [color];
         let mut rendering = vk::CommandBufferInheritanceRenderingInfo::builder()
@@ -418,6 +420,8 @@ impl RecordingWorker {
         job: &RecordingJob,
         batches: &[RecordedBatch],
     ) {
+        #[cfg(feature = "tracy")]
+        let _span = crate::tracy::span_with_callstack(crate::tracy::span_location!("Vulkan::record_job"));
         let batch = &batches[job.batch];
         let draws = &batch.draws[job.draws.clone()];
         let command =
@@ -433,6 +437,8 @@ impl RecordingWorker {
 
 pub(crate) struct CommandRecorder {
     pool: Option<rayon::ThreadPool>,
+    #[cfg(feature = "tracy")]
+    tracy_registered: bool,
     workers: Vec<RecordingWorker>,
     pub draws: Vec<RecordedDraw>,
     batches: Vec<RecordedBatch>,
@@ -487,6 +493,12 @@ impl CommandRecorder {
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(threads)
                     .thread_name(|id| format!("vulkan-record-{id}"))
+                    .start_handler(|id| {
+                        #[cfg(feature = "tracy")]
+                        crate::tracy::register_thread(&format!("vulkan-record-{id}"));
+                        #[cfg(not(feature = "tracy"))]
+                        let _ = id;
+                    })
                     .build()
                     .expect("Failed to create the Vulkan recording pool"),
             )
@@ -508,6 +520,8 @@ impl CommandRecorder {
             .collect();
         Self {
             pool,
+            #[cfg(feature = "tracy")]
+            tracy_registered: false,
             workers,
             draws: Vec::new(),
             batches: Vec::new(),
@@ -594,6 +608,22 @@ impl CommandRecorder {
     }
 
     pub fn execute(&mut self, device: &Device, primary: vk::CommandBuffer, slot: usize) {
+        #[cfg(feature = "tracy")]
+        let _span = crate::tracy::span_with_callstack(crate::tracy::span_location!("Vulkan::record_execute"));
+        #[cfg(feature = "tracy")]
+        {
+            let connected = tracy_client::Client::is_connected();
+            if connected && !self.tracy_registered {
+                // On-demand capture may connect after worker startup. Register
+                // every worker once, including workers with no recording jobs.
+                if let Some(pool) = &self.pool {
+                    pool.broadcast(|context| crate::tracy::register_thread(&format!("vulkan-record-{}", context.index())));
+                }
+                self.tracy_registered = true;
+            } else if !connected {
+                self.tracy_registered = false;
+            }
+        }
         if self.primary.is_empty() {
             return;
         }
