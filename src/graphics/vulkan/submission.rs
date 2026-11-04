@@ -61,6 +61,8 @@ impl FrameSubmission {
         queue: vk::Queue,
         prepared: impl FnOnce(AcquireResult),
     ) -> PresentResult {
+        #[cfg(feature = "tracy")]
+        let _span = crate::tracy::span_with_callstack(crate::tracy::span_location!("Vulkan::submit_and_present"));
         let command_buffers = [self.command_buffer];
         let wait_semaphores = [self.wait.unwrap_or_default()];
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
@@ -79,6 +81,8 @@ impl FrameSubmission {
             .image_indices(&image_indices);
         unsafe {
             {
+                #[cfg(feature = "tracy")]
+                let _span = crate::tracy::span_with_callstack(crate::tracy::span_location!("Vulkan::queue_submit"));
                 if let Err(error) = device.queue_submit(queue, &[submit.build()], self.fence) {
                     if self.next_acquire.is_some() {
                         prepared(Err(error));
@@ -88,6 +92,8 @@ impl FrameSubmission {
             }
             if let Some(semaphore) = self.next_acquire {
                 let result = {
+                    #[cfg(feature = "tracy")]
+                    let _span = crate::tracy::span(crate::tracy::span_location!("Vulkan::preacquire_next_image (wall time)"));
                     match swapchain.acquire_next_image(self.swapchain, 0, semaphore, vk::Fence::null()) {
                         Ok((image_index, suboptimal)) => Ok(Some(PreparedImage {
                             swapchain: self.swapchain,
@@ -103,6 +109,8 @@ impl FrameSubmission {
                 };
                 prepared(result);
             }
+            #[cfg(feature = "tracy")]
+            let _span = crate::tracy::span_with_callstack(crate::tracy::span_location!("Vulkan::queue_present"));
             match swapchain.queue_present(queue, &present) {
                 Ok(suboptimal) => Ok(suboptimal),
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::SUBOPTIMAL_KHR) => Ok(true),
@@ -158,7 +166,15 @@ impl SubmissionWorker {
         let thread = thread::Builder::new()
             .name("vulkan-submit".into())
             .spawn(move || {
-                while let Ok(frame) = receiver.recv() {
+                #[cfg(feature = "tracy")]
+                crate::tracy::register_thread("vulkan-submit");
+                loop {
+                    let received = {
+                        #[cfg(feature = "tracy")]
+                        let _span = crate::tracy::span_with_callstack(crate::tracy::span_location!("Vulkan::submit_wait_request (wall time)"));
+                        receiver.recv()
+                    };
+                    let Ok(frame) = received else { break };
                     let slot = frame.slot;
                     let result = execute(frame, &mut |result| {
                         let _ = completed.send(SubmissionEvent::Prepared(result));
@@ -185,6 +201,8 @@ impl SubmissionWorker {
     }
 
     pub fn submit(&mut self, frame: FrameSubmission) {
+        #[cfg(feature = "tracy")]
+        let _span = crate::tracy::span_with_callstack(crate::tracy::span_location!("Vulkan::submit_enqueue"));
         let slot = frame.slot;
         assert!(
             !self.pending[slot],
@@ -228,6 +246,8 @@ impl SubmissionWorker {
     /// Wait only for submission and nonblocking acquisition, leaving the
     /// current present call free to run while the context records next frame.
     pub fn wait_prepared(&mut self) -> Result<(Option<PreparedImage>, bool), vk::Result> {
+        #[cfg(feature = "tracy")]
+        let _span = crate::tracy::span(crate::tracy::span_location!("Vulkan::submit_wait_prepared (wall time)"));
         let mut recreate = false;
         while self.acquiring {
             let event = self.completed.recv()
@@ -244,6 +264,8 @@ impl SubmissionWorker {
     }
 
     pub fn wait_slot(&mut self, slot: usize) -> PresentResult {
+        #[cfg(feature = "tracy")]
+        let _span = crate::tracy::span(crate::tracy::span_location!("Vulkan::submit_wait_slot (wall time)"));
         let mut recreate = false;
         while self.pending[slot] {
             let completion = self
@@ -259,6 +281,8 @@ impl SubmissionWorker {
     /// waits for host calls; the caller must also wait on the GPU before freeing
     /// resources or resetting commands that may still be in flight.
     pub fn drain(&mut self) -> PresentResult {
+        #[cfg(feature = "tracy")]
+        let _span = crate::tracy::span_with_callstack(crate::tracy::span_location!("Vulkan::submit_drain (wall time)"));
         let mut recreate = false;
         for slot in 0..MAX_FRAMES_IN_FLIGHT {
             recreate |= self.wait_slot(slot)?;
