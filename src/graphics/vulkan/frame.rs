@@ -1584,12 +1584,13 @@ impl VulkanContext {
             fence: self.in_flight[self.current_frame],
             swapchain: self.swapchain,
             image_index: image_index as u32,
+            next_acquire: None,
         };
         if let Some(worker) = &mut self.submission {
             worker.submit(submission);
         } else {
             self.presentation_needs_recreate |= submission
-                .execute(&self.device, &self.swapchain_loader, self.graphics_queue)
+                .execute(&self.device, &self.swapchain_loader, self.graphics_queue, |_| {})
                 .expect("Failed to submit or present the frame");
         }
         self.presentation_needs_recreate |= self.swapchain_suboptimal;

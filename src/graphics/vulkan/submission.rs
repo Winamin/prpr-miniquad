@@ -9,6 +9,10 @@
 //! externally synchronized, and `vkAcquireNextImageKHR` must not race the
 //! worker's `vkQueuePresentKHR` on the same swapchain (see
 //! `VulkanContext::begin_frame`).
+//!
+//! Before presenting, the worker can acquire the next image without waiting
+//! and publish it to the context. Recording into that image does not access
+//! the queue or swapchain, so it can overlap the current host present call.
 
 use ash::{extensions::khr::Swapchain, vk, Device};
 use std::{
@@ -19,6 +23,20 @@ use std::{
 use super::MAX_FRAMES_IN_FLIGHT;
 
 type PresentResult = Result<bool, vk::Result>;
+type AcquireResult = Result<Option<PreparedImage>, vk::Result>;
+
+#[derive(Debug, PartialEq)]
+pub(super) struct PreparedImage {
+    pub swapchain: vk::SwapchainKHR,
+    pub image_index: u32,
+    pub semaphore: vk::Semaphore,
+    pub suboptimal: bool,
+}
+
+enum SubmissionEvent {
+    Prepared(AcquireResult),
+    Completed(usize, PresentResult),
+}
 
 pub(super) struct FrameSubmission {
     pub slot: usize,
@@ -28,17 +46,20 @@ pub(super) struct FrameSubmission {
     pub fence: vk::Fence,
     pub swapchain: vk::SwapchainKHR,
     pub image_index: u32,
+    /// A semaphore whose previous GPU wait has finished. The next frame uses
+    /// it only if the worker successfully acquires another image.
+    pub next_acquire: Option<vk::Semaphore>,
 }
 
 impl FrameSubmission {
-    /// Both calls access the same queue and swapchain. Callers either run them
-    /// on the queue worker or drain that worker before accessing the queue or
-    /// the swapchain themselves.
+    /// Queue and acquisition calls share one worker. Other callers drain it
+    /// before accessing the queue or the swapchain themselves.
     pub fn execute(
         &self,
         device: &Device,
         swapchain: &Swapchain,
         queue: vk::Queue,
+        prepared: impl FnOnce(AcquireResult),
     ) -> PresentResult {
         let command_buffers = [self.command_buffer];
         let wait_semaphores = [self.wait.unwrap_or_default()];
@@ -57,7 +78,31 @@ impl FrameSubmission {
             .swapchains(&swapchains)
             .image_indices(&image_indices);
         unsafe {
-            device.queue_submit(queue, &[submit.build()], self.fence)?;
+            {
+                if let Err(error) = device.queue_submit(queue, &[submit.build()], self.fence) {
+                    if self.next_acquire.is_some() {
+                        prepared(Err(error));
+                    }
+                    return Err(error);
+                }
+            }
+            if let Some(semaphore) = self.next_acquire {
+                let result = {
+                    match swapchain.acquire_next_image(self.swapchain, 0, semaphore, vk::Fence::null()) {
+                        Ok((image_index, suboptimal)) => Ok(Some(PreparedImage {
+                            swapchain: self.swapchain,
+                            image_index,
+                            semaphore,
+                            suboptimal,
+                        })),
+                        // Never stall the queue worker waiting for an image
+                        // which its upcoming present may need to release.
+                        Err(vk::Result::NOT_READY | vk::Result::TIMEOUT) => Ok(None),
+                        Err(error) => Err(error),
+                    }
+                };
+                prepared(result);
+            }
             match swapchain.queue_present(queue, &present) {
                 Ok(suboptimal) => Ok(suboptimal),
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::SUBOPTIMAL_KHR) => Ok(true),
@@ -69,8 +114,11 @@ impl FrameSubmission {
 
 pub(super) struct SubmissionWorker {
     requests: Option<SyncSender<FrameSubmission>>,
-    completed: Receiver<(usize, PresentResult)>,
+    completed: Receiver<SubmissionEvent>,
     pending: [bool; MAX_FRAMES_IN_FLIGHT],
+    preacquire: bool,
+    acquiring: bool,
+    prepared: Option<PreparedImage>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -89,12 +137,22 @@ impl SubmissionWorker {
         }
         let device = device.clone();
         let swapchain = swapchain.clone();
-        Some(Self::spawn(move |frame| {
-            frame.execute(&device, &swapchain, queue)
-        }))
+        let mut worker = Self::spawn(move |frame, prepared| {
+            frame.execute(&device, &swapchain, queue, prepared)
+        });
+        worker.preacquire = std::env::var("PRPR_VULKAN_PREACQUIRE")
+            .map(|value| {
+                !matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off")
+            })
+            .unwrap_or(true);
+        Some(worker)
     }
 
-    fn spawn(mut execute: impl FnMut(FrameSubmission) -> PresentResult + Send + 'static) -> Self {
+    fn spawn(
+        mut execute: impl FnMut(FrameSubmission, &mut dyn FnMut(AcquireResult)) -> PresentResult
+            + Send
+            + 'static,
+    ) -> Self {
         let (requests, receiver) = mpsc::sync_channel::<FrameSubmission>(MAX_FRAMES_IN_FLIGHT);
         let (completed, completion_receiver) = mpsc::channel();
         let thread = thread::Builder::new()
@@ -102,10 +160,12 @@ impl SubmissionWorker {
             .spawn(move || {
                 while let Ok(frame) = receiver.recv() {
                     let slot = frame.slot;
-                    let result = execute(frame);
+                    let result = execute(frame, &mut |result| {
+                        let _ = completed.send(SubmissionEvent::Prepared(result));
+                    });
                     // The context may be unwinding; shutdown still consumes all
                     // queued requests before releasing the device references.
-                    let _ = completed.send((slot, result));
+                    let _ = completed.send(SubmissionEvent::Completed(slot, result));
                 }
             })
             .expect("Failed to create the Vulkan submission thread");
@@ -113,8 +173,15 @@ impl SubmissionWorker {
             requests: Some(requests),
             completed: completion_receiver,
             pending: [false; MAX_FRAMES_IN_FLIGHT],
+            preacquire: true,
+            acquiring: false,
+            prepared: None,
             thread: Some(thread),
         }
+    }
+
+    pub fn preacquire_enabled(&self) -> bool {
+        self.preacquire
     }
 
     pub fn submit(&mut self, frame: FrameSubmission) {
@@ -123,6 +190,13 @@ impl SubmissionWorker {
             !self.pending[slot],
             "frame slot still owned by the submission thread"
         );
+        if frame.next_acquire.is_some() {
+            assert!(
+                !self.acquiring && self.prepared.is_none(),
+                "next image was not consumed"
+            );
+            self.acquiring = true;
+        }
         self.requests
             .as_ref()
             .unwrap()
@@ -131,9 +205,42 @@ impl SubmissionWorker {
         self.pending[slot] = true;
     }
 
-    fn complete(&mut self, (slot, result): (usize, PresentResult)) -> PresentResult {
-        self.pending[slot] = false;
-        result
+    fn complete(&mut self, event: SubmissionEvent) -> PresentResult {
+        match event {
+            SubmissionEvent::Completed(slot, result) => {
+                self.pending[slot] = false;
+                result
+            }
+            SubmissionEvent::Prepared(result) => {
+                self.acquiring = false;
+                match result {
+                    Ok(image) => {
+                        self.prepared = image;
+                        Ok(false)
+                    }
+                    Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::SUBOPTIMAL_KHR) => Ok(true),
+                    Err(error) => Err(error),
+                }
+            }
+        }
+    }
+
+    /// Wait only for submission and nonblocking acquisition, leaving the
+    /// current present call free to run while the context records next frame.
+    pub fn wait_prepared(&mut self) -> Result<(Option<PreparedImage>, bool), vk::Result> {
+        let mut recreate = false;
+        while self.acquiring {
+            let event = self.completed.recv()
+                .expect("Vulkan submission thread stopped");
+            recreate |= self.complete(event)?;
+        }
+        Ok((self.prepared.take(), recreate))
+    }
+
+    /// Called after draining, before replacing swapchain/semaphore handles.
+    pub fn discard_prepared(&mut self) {
+        assert!(!self.acquiring);
+        self.prepared = None;
     }
 
     pub fn wait_slot(&mut self, slot: usize) -> PresentResult {
@@ -188,13 +295,14 @@ mod tests {
             fence: vk::Fence::null(),
             swapchain: vk::SwapchainKHR::null(),
             image_index: 0,
+            next_acquire: None,
         }
     }
 
     #[test]
     fn submit_returns_before_host_work_finishes() {
         let (release, ready) = mpsc::channel();
-        let mut worker = SubmissionWorker::spawn(move |_| {
+        let mut worker = SubmissionWorker::spawn(move |_, _| {
             ready.recv().unwrap();
             Ok(false)
         });
@@ -207,7 +315,7 @@ mod tests {
 
     #[test]
     fn waiting_for_a_later_slot_preserves_earlier_present_results() {
-        let mut worker = SubmissionWorker::spawn(|frame| Ok(frame.slot == 0));
+        let mut worker = SubmissionWorker::spawn(|frame, _| Ok(frame.slot == 0));
         worker.submit(frame(0));
         worker.submit(frame(1));
         assert_eq!(worker.wait_slot(1), Ok(true));
@@ -216,7 +324,7 @@ mod tests {
 
     #[test]
     fn submission_failure_is_returned_before_waiting_on_a_gpu_fence() {
-        let mut worker = SubmissionWorker::spawn(|_| Err(vk::Result::ERROR_DEVICE_LOST));
+        let mut worker = SubmissionWorker::spawn(|_, _| Err(vk::Result::ERROR_DEVICE_LOST));
         worker.submit(frame(0));
         assert_eq!(worker.wait_slot(0), Err(vk::Result::ERROR_DEVICE_LOST));
         assert!(!worker.pending[0]);
@@ -226,7 +334,7 @@ mod tests {
     fn shutdown_finishes_queued_host_work() {
         let completed = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&completed);
-        let mut worker = SubmissionWorker::spawn(move |_| {
+        let mut worker = SubmissionWorker::spawn(move |_, _| {
             count.fetch_add(1, Ordering::Relaxed);
             Ok(false)
         });
@@ -234,5 +342,106 @@ mod tests {
         worker.submit(frame(1));
         drop(worker);
         assert_eq!(completed.load(Ordering::Relaxed), 2);
+    }
+
+    fn acquiring_frame(slot: usize) -> FrameSubmission {
+        let mut request = frame(slot);
+        request.next_acquire = Some(vk::Semaphore::null());
+        request
+    }
+
+    fn image(image_index: u32) -> PreparedImage {
+        PreparedImage {
+            swapchain: vk::SwapchainKHR::null(),
+            image_index,
+            semaphore: vk::Semaphore::null(),
+            suboptimal: false,
+        }
+    }
+
+    #[test]
+    fn next_image_is_available_while_present_is_still_running() {
+        let (release, ready) = mpsc::channel();
+        let mut worker = SubmissionWorker::spawn(move |_, prepared| {
+            prepared(Ok(Some(image(2))));
+            ready.recv().unwrap();
+            Ok(false)
+        });
+        worker.submit(acquiring_frame(0));
+        let result = worker.wait_prepared();
+        let present_still_pending = worker.pending[0];
+        release.send(()).unwrap();
+        assert_eq!(result, Ok((Some(image(2)), false)));
+        assert!(present_still_pending);
+        assert_eq!(worker.drain(), Ok(false));
+    }
+
+    #[test]
+    fn no_free_image_returns_control_before_present_finishes() {
+        let (release, ready) = mpsc::channel();
+        let mut worker = SubmissionWorker::spawn(move |_, prepared| {
+            prepared(Ok(None));
+            ready.recv().unwrap();
+            Ok(false)
+        });
+        worker.submit(acquiring_frame(0));
+        let result = worker.wait_prepared();
+        let present_still_pending = worker.pending[0];
+        release.send(()).unwrap();
+        assert_eq!(result, Ok((None, false)));
+        assert!(present_still_pending);
+        assert_eq!(worker.drain(), Ok(false));
+    }
+
+    #[test]
+    fn early_submission_failure_reaches_the_image_waiter() {
+        let mut worker = SubmissionWorker::spawn(|_, prepared| {
+            prepared(Err(vk::Result::ERROR_DEVICE_LOST));
+            Err(vk::Result::ERROR_DEVICE_LOST)
+        });
+        worker.submit(acquiring_frame(0));
+        assert_eq!(worker.wait_prepared(), Err(vk::Result::ERROR_DEVICE_LOST));
+        assert_eq!(worker.drain(), Err(vk::Result::ERROR_DEVICE_LOST));
+        assert!(!worker.pending[0]);
+    }
+
+    #[test]
+    fn waiting_for_next_image_preserves_the_previous_present_result() {
+        let mut worker = SubmissionWorker::spawn(|request, prepared| {
+            prepared(Ok(Some(image(request.slot as u32))));
+            Ok(request.slot == 0)
+        });
+        worker.submit(acquiring_frame(0));
+        assert_eq!(worker.wait_prepared(), Ok((Some(image(0)), false)));
+        worker.submit(acquiring_frame(1));
+        assert_eq!(worker.wait_prepared(), Ok((Some(image(1)), true)));
+        assert!(!worker.pending[0]);
+        assert_eq!(worker.drain(), Ok(false));
+    }
+
+    #[test]
+    fn resource_drains_keep_the_image_until_consumed_or_discarded() {
+        let mut worker = SubmissionWorker::spawn(|_, prepared| {
+            prepared(Ok(Some(image(2))));
+            Ok(false)
+        });
+        worker.submit(acquiring_frame(0));
+        assert_eq!(worker.drain(), Ok(false));
+        assert_eq!(worker.wait_prepared(), Ok((Some(image(2)), false)));
+        worker.submit(acquiring_frame(1));
+        assert_eq!(worker.drain(), Ok(false));
+        worker.discard_prepared();
+        assert_eq!(worker.wait_prepared(), Ok((None, false)));
+    }
+
+    #[test]
+    fn out_of_date_acquisition_requests_recreation_without_an_image() {
+        let mut worker = SubmissionWorker::spawn(|_, prepared| {
+            prepared(Err(vk::Result::ERROR_OUT_OF_DATE_KHR));
+            Ok(false)
+        });
+        worker.submit(acquiring_frame(0));
+        assert_eq!(worker.wait_prepared(), Ok((None, true)));
+        assert_eq!(worker.drain(), Ok(false));
     }
 }
